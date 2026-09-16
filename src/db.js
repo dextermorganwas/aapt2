@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS tpdb_state (
   fail_count INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   match_posters_page_id TEXT,
+  matcher_version INTEGER,
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -78,6 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_request_log_media ON request_log(media_id);
 ensureColumn('art', 'selection_stage', 'TEXT');
 ensureColumn('art', 'selection_reason', 'TEXT');
 ensureColumn('art', 'resolver_version', 'INTEGER');
+ensureColumn('tpdb_state', 'matcher_version', 'INTEGER');
 
 logger.info(`SQLite database ready at ${config.dbPath}`);
 
@@ -173,18 +175,19 @@ function upsertTpdbState(mediaId, patch) {
     failCount: patch.failCount ?? current?.fail_count ?? 0,
     lastError: patch.lastError ?? current?.last_error ?? null,
     matchPostersPageId: patch.matchPostersPageId ?? current?.match_posters_page_id ?? null,
+    matcherVersion: config.tpdbMatcherVersion,
     updatedAt: now,
   };
-  db.prepare(`INSERT INTO tpdb_state(media_id,status,last_attempt_at,next_attempt_at,fail_count,last_error,match_posters_page_id,updated_at)
-    VALUES(@mediaId,@status,@lastAttemptAt,@nextAttemptAt,@failCount,@lastError,@matchPostersPageId,@updatedAt)
+  db.prepare(`INSERT INTO tpdb_state(media_id,status,last_attempt_at,next_attempt_at,fail_count,last_error,match_posters_page_id,matcher_version,updated_at)
+    VALUES(@mediaId,@status,@lastAttemptAt,@nextAttemptAt,@failCount,@lastError,@matchPostersPageId,@matcherVersion,@updatedAt)
     ON CONFLICT(media_id) DO UPDATE SET status=excluded.status,last_attempt_at=excluded.last_attempt_at,
       next_attempt_at=excluded.next_attempt_at,fail_count=excluded.fail_count,last_error=excluded.last_error,
-      match_posters_page_id=excluded.match_posters_page_id,updated_at=excluded.updated_at`).run(data);
+      match_posters_page_id=excluded.match_posters_page_id,matcher_version=excluded.matcher_version,updated_at=excluded.updated_at`).run(data);
   return getTpdbState(mediaId);
 }
 function tpdbIsDue(mediaId) {
   const s = getTpdbState(mediaId);
-  if (!s || !s.next_attempt_at) return true;
+  if (!s || s.matcher_version !== config.tpdbMatcherVersion || !s.next_attempt_at) return true;
   return Date.now() >= new Date(s.next_attempt_at).getTime();
 }
 function resetTpdbState(mediaId) { db.prepare(`DELETE FROM tpdb_state WHERE media_id=?`).run(mediaId); }
@@ -192,8 +195,8 @@ function listDueTpdb(limit=100) {
   return db.prepare(`SELECT m.* FROM media m LEFT JOIN tpdb_state s ON s.media_id=m.id
     LEFT JOIN art a ON a.media_id=m.id AND a.art_type='poster'
     WHERE (a.id IS NULL OR a.source <> 'theposterdb')
-      AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= datetime('now'))
-    ORDER BY COALESCE(s.next_attempt_at,'1970-01-01') ASC LIMIT ?`).all(limit);
+      AND (s.matcher_version IS NULL OR s.matcher_version <> ? OR s.next_attempt_at IS NULL OR s.next_attempt_at <= datetime('now'))
+    ORDER BY COALESCE(s.next_attempt_at,'1970-01-01') ASC LIMIT ?`).all(config.tpdbMatcherVersion, limit);
 }
 
 function logRequest(mediaId, artType) { db.prepare(`INSERT INTO request_log(media_id,art_type) VALUES(?,?)`).run(mediaId,artType); }

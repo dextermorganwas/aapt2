@@ -53,7 +53,7 @@ module.exports = {
   tpdbFirstAttemptDelaySeconds: int(process.env.TPDB_FIRST_ATTEMPT_DELAY_SECONDS, 0),
   tpdbRetryBaseSeconds: int(process.env.TPDB_RETRY_BASE_SECONDS, 1800),
   tpdbRetryMaxSeconds: int(process.env.TPDB_RETRY_MAX_SECONDS, 86400),
-  tpdbMatcherVersion: int(process.env.TPDB_MATCHER_VERSION, 4),
+  tpdbMatcherVersion: int(process.env.TPDB_MATCHER_VERSION, 5),
   tpdbBackgroundPollSeconds: int(process.env.TPDB_BACKGROUND_POLL_SECONDS, 300),
 
   // --- Concurrency / resource usage ---
@@ -72,7 +72,8 @@ module.exports = {
 
   // How many candidate ThePosterDB sets to actually open (each costs one request) before
   // giving up on a title. Keep this modest - it directly controls TPDB load & latency.
-  tpdbMaxCandidates: int(process.env.TPDB_MAX_CANDIDATES, 6),
+  tpdbMaxCandidates: int(process.env.TPDB_MAX_CANDIDATES, 10),
+  tpdbMaxSearchPages: int(process.env.TPDB_MAX_SEARCH_PAGES, 3),
   tpdbMaxSetsToInspectInParallel: int(process.env.TPDB_MAX_SETS_IN_PARALLEL, 3),
   maxImageBytes: int(process.env.MAX_IMAGE_BYTES, 25000000),
 

@@ -34,10 +34,44 @@ function exactTarget(candidates, title, year) {
 
 async function search(term, mediaType, background=false) {
   const section=mediaType==='series'?'shows':'movies';
-  const html=await get(`/search?${new URLSearchParams({term,section})}`, {background});
-  return {html, targets: parseSearchTargets(html)};
+  const out=[]; const seen=new Set(); let url=`/search?${new URLSearchParams({term,section})}`; let pagesFetched=0;
+  while(url && pagesFetched < config.tpdbMaxSearchPages){
+    const html=await get(url,{background});
+    for(const c of parseSearchTargets(html)) if(!seen.has(c.id)){seen.add(c.id);out.push(c);}
+    pagesFetched++;
+    const $=cheerio.load(html||'');
+    let next=$('a[rel="next"]').attr('href') || $('a[rel~="next"]').attr('href') || '';
+    if(!next){
+      const raw=(html||'').match(/<a[^>]+href=["']([^"']+)["'][^>]*rel=["'][^"']*next[^"']*["'][^>]*>/i);
+      next=raw?.[1]||'';
+    }
+    url=next ? abs(next) : '';
+  }
+  return {targets:out,pagesFetched};
 }
 
+async function findPostersPageIds({title,year,mediaType,tmdbId,imdbId,tvdbId}, opts={}) {
+  const seen=new Set(), pages=[]; let hadError=false;
+  // Search the title first. The exact title/year candidate is generally the fastest
+  // path and avoids waiting on three sequential identifier searches.
+  try {
+    const r=await search(title,mediaType,!!opts.background);
+    const exact=r.targets.filter(c=>normalizeTitle(c.text.replace(/\s*\(\d{4}\).*$/,''))===normalizeTitle(title));
+    exact.sort((a,b)=>(String(a.year)===String(year)?0:1)-(String(b.year)===String(year)?0:1));
+    for(const c of [...exact,...r.targets]){
+      if(pages.length>=Math.max(config.tpdbMaxCandidates,10)) break;
+      if(!seen.has(c.id)){seen.add(c.id);pages.push({id:c.id,via:'title',searchTerm:title,year:c.year});}
+    }
+  } catch(e){ hadError=true; logger.debug('TPDB title search failed:',e.message); }
+
+  const terms=[...new Set([tmdbId,imdbId,tvdbId].filter(Boolean).map(String))];
+  const results=await Promise.allSettled(terms.map(term=>search(term,mediaType,!!opts.background)));
+  results.forEach((res,i)=>{
+    if(res.status==='rejected'){hadError=true;logger.debug(`TPDB identifier search ${terms[i]} failed:`,res.reason?.message||res.reason);return;}
+    for(const c of res.value.targets.slice(0,config.tpdbMaxCandidates)) if(!seen.has(c.id)){seen.add(c.id);pages.push({id:c.id,via:'identifier',searchTerm:terms[i],year:c.year});}
+  });
+  return {pages,hadError};
+}
 async function findPostersPageIds({title,year,mediaType,tmdbId,imdbId,tvdbId}, opts={}) {
   const seen=new Set(), pages=[]; let hadError=false;
   const terms=[...new Set([tmdbId, imdbId, tvdbId].filter(Boolean).map(String))];
@@ -90,9 +124,8 @@ async function verifySetIdentity(setId, lookup, opts={}) {
   return {ok: idMatch || titleOk, html, ids, titleText};
 }
 
-async function getSetPosters(setId, opts={}) {
-  const html=await get(`/set/${setId}`,opts); if(!html)return {html:null,posters:[]};
-  const $=cheerio.load(html); const posters=[];
+async function parsePosterListingHtml(html){
+  const $=cheerio.load(html||''); const posters=[];
   $('div.overlay[data-poster-id]').each((_,el)=>{
     const id=$(el).attr('data-poster-id'); if(!id)return;
     const card=$(el).closest('div.col-6.col-lg-2.p-1').length?$(el).closest('div.col-6.col-lg-2.p-1'):$(el).parent().parent();
@@ -100,8 +133,16 @@ async function getSetPosters(setId, opts={}) {
     const caption=(card.find('p.p-0.mb-1.text-break').first().text()||'').replace(/\s+/g,' ').trim();
     posters.push({assetId:id,mediaTypeLabel:label,caption});
   });
-  const setTitle=$('p#set-title').text().replace(/\s+/g,' ').trim();
-  return {html,posters,setTitle,externalIds:parseExternalIds(html)};
+  return {html,posters,setTitle:$('p#set-title').text().replace(/\s+/g,' ').trim(),externalIds:parseExternalIds(html)};
+}
+async function getSetPosters(setId, opts={}) {
+  const pageHtml=await get(`/posters/${setId}`,opts); if(pageHtml){
+    const parsed=await parsePosterListingHtml(pageHtml);
+    if(parsed.posters.length) return parsed;
+  }
+  // Some older/alternate TPDb pages expose the grid under /set/{id}; retain it only as fallback.
+  const setHtml=await get(`/set/${setId}`,opts); if(!setHtml)return {html:null,posters:[]};
+  return parsePosterListingHtml(setHtml);
 }
 async function getPosterMeta(assetId, opts={}) {
   const html=await get(`/poster/${assetId}`,opts); if(!html)return null;
@@ -118,36 +159,33 @@ function relevantPosters(posters, mediaType){
   });
 }
 async function findEnglishOriginalPoster(args){
-  const {title,year,mediaType,tmdbId,imdbId,tvdbId,background=false}=args;
+  const {title,year,mediaType,background=false}=args;
   const searchResult=await findPostersPageIds(args,{background});
-  const pages=searchResult.pages;
+  const pages=searchResult.pages; let inspected=0; let failures=0;
   for(const page of pages){
-    const setIds=await getCandidateSets(page.id,config.tpdbMaxCandidates,{background});
-    for(let i=0;i<setIds.length;i+=config.tpdbMaxSetsToInspectInParallel){
-      const batch=setIds.slice(i,i+config.tpdbMaxSetsToInspectInParallel);
-      const inspected=await Promise.all(batch.map(async setId=>{
-        const sp=await getSetPosters(setId,{background});
-        const titleOk=!title || normalizeTitle(sp.setTitle||'').includes(normalizeTitle(title));
-        const idOk=(tmdbId && sp.externalIds?.tmdbId===String(tmdbId)) || (imdbId && sp.externalIds?.imdbId===String(imdbId)) || (tvdbId && sp.externalIds?.tvdbId===String(tvdbId));
-        const candidateIdentity = pages.some(p=>p.id===page.id && p.via==='identifier') ? (idOk || titleOk) : titleOk;
-        const relevant=candidateIdentity ? relevantPosters(sp.posters,mediaType) : [];
-        return {setId,posters:relevant};
-      }));
-      for(const x of inspected){
-        for(let start=0; start<x.posters.length; start+=3){
-          const batchPosters=x.posters.slice(start,start+3);
-          const metas=await Promise.all(batchPosters.map(p=>getPosterMeta(p.assetId,{background}).catch(()=>null)));
-          for(let j=0;j<batchPosters.length;j++){
-            const p=batchPosters[j], meta=metas[j];
-            if(meta && /^english$/i.test(meta.language) && /^original$/i.test(meta.variation)){
-              return {postersPageId:page.id,result:{assetId:p.assetId,imageUrl:assetImageUrl(p.assetId),...meta,setId:x.setId},status:'found'};
-            }
-          }
+    try {
+      const sp=await getSetPosters(page.id,{background}); inspected++;
+      const titleNorm=normalizeTitle(title);
+      const pageTitleNorm=normalizeTitle((sp.setTitle||'').replace(/\s*\(\d{4}\).*$/,''));
+      const yearMatch=String(sp.setTitle||'').match(/\((\d{4})\)/);
+      const titleOk=!title || pageTitleNorm===titleNorm || pageTitleNorm.includes(titleNorm);
+      const yearOk=!year || !yearMatch || yearMatch[1]===String(year);
+      const idOk=(args.tmdbId && sp.externalIds?.tmdbId===String(args.tmdbId)) || (args.imdbId && sp.externalIds?.imdbId===String(args.imdbId)) || (args.tvdbId && sp.externalIds?.tvdbId===String(args.tvdbId));
+      if(page.via==='identifier' ? !(idOk || titleOk) : !(titleOk && yearOk)) continue;
+
+      const relevant=relevantPosters(sp.posters,mediaType);
+      for(let i=0;i<relevant.length;i+=config.tpdbMaxPosterMetaInParallel){
+        const batch=relevant.slice(i,i+config.tpdbMaxPosterMetaInParallel);
+        const metas=await Promise.all(batch.map(p=>getPosterMeta(p.assetId,{background}).catch(e=>{failures++;return null;})));
+        for(let j=0;j<batch.length;j++){
+          const p=batch[j], meta=metas[j];
+          if(meta && /^english$/i.test(meta.language) && /^original$/i.test(meta.variation)) return {postersPageId:page.id,result:{assetId:p.assetId,imageUrl:assetImageUrl(p.assetId),...meta,setId:page.id},status:'found'};
         }
       }
-    }
+    } catch(e){ failures++; logger.debug(`TPDB poster page ${page.id} failed:`,e.message); }
   }
-  return {postersPageId:pages[0]?.id||null,result:null,status:searchResult.hadError && pages.length===0?'error':'not_found'};
+  const status=(failures>0 && inspected===0) || (failures>0 && inspected===pages.length && pages.length>0 ? 'error' : 'not_found');
+  return {postersPageId:pages[0]?.id||null,result:null,status:searchResult.hadError && !pages.length?'error':status};
 }
 async function downloadPoster(assetId,{background=false}={}){
   const url=assetImageUrl(assetId); const result=await fetchBuffer(url,{timeoutMs:config.tpdbTimeoutMs*3,priority:background?'background':'live'});

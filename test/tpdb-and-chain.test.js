@@ -27,3 +27,9 @@ test('TVDB textless picker prefers explicit includesText=false in API order', ()
   ]);
   assert.equal(value.id, 2);
 });
+
+
+test('TPDb parser keeps poster-set targets distinct from arbitrary artwork assets', () => {
+  const targets = tpdb.parseSearchTargets('<a href="/posters/6792">Breaking Bad (2008)</a><div data-poster-id="999">Other title</div>');
+  assert.deepEqual(targets, [{ id: '6792', text: 'Breaking Bad (2008)', year: '2008' }]);
+});

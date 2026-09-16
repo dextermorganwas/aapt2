@@ -8,24 +8,21 @@ const metahub = require('../providers/metahub');
 const { buildContext } = require('./resolveArt');
 
 async function listTpdbCandidates(ctx, mediaRow) {
-  const title=ctx.title||mediaRow.title; if(!title)return [];
-  const searchResult=await tpdb.findPostersPageIds({title,year:ctx.year||mediaRow.year,mediaType:ctx.type,tmdbId:ctx.tmdbId||mediaRow.tmdb_id,imdbId:ctx.imdbId||mediaRow.imdb_id,tvdbId:ctx.tvdbId||mediaRow.tvdb_id});
-  const pageIds=[...new Set(searchResult.pages.map(p=>p.id))].slice(0,3);
+  const title=ctx.title||mediaRow.title; const year=ctx.year||mediaRow.year;
+  const searchResult=await tpdb.findPostersPageIds({title,year,mediaType:ctx.type,tmdbId:ctx.tmdbId||mediaRow.tmdb_id,imdbId:ctx.imdbId||mediaRow.imdb_id,tvdbId:ctx.tvdbId||mediaRow.tvdb_id});
   const out=[];
-  for(const pageId of pageIds){
-    const setIds=await tpdb.getCandidateSets(pageId,Math.max(config.tpdbMaxCandidates,12));
-    const sets=await Promise.all(setIds.map(async setId=>{
-      try { const sp=await tpdb.getSetPosters(setId); return {setId,posters:tpdb.relevantPosters(sp.posters,ctx.type)}; }
-      catch(e){ logger.debug(`TPDB browse set ${setId} failed:`,e.message); return {setId,posters:[]}; }
-    }));
-    for(const s of sets){
-      const metas=await Promise.all(s.posters.map(p=>tpdb.getPosterMeta(p.assetId).catch(()=>null)));
-      s.posters.forEach((p,i)=>{
-        const m=metas[i]; out.push({source:'theposterdb',id:p.assetId,setId:s.setId,imageUrl:tpdb.assetImageUrl(p.assetId),language:m?.language||null,variation:m?.variation||null,label:[m?.language,m?.variation,ctx.type==='series'?'Show Cover':'Movie',`set ${s.setId}`].filter(Boolean).join(' / ')});
-      });
-    }
+  for(const page of searchResult.pages.slice(0, Math.max(config.tpdbMaxCandidates,12))){
+    try {
+      const sp=await tpdb.getSetPosters(page.id);
+      const relevant=tpdb.relevantPosters(sp.posters,ctx.type);
+      const metas=await Promise.all(relevant.map(p=>tpdb.getPosterMeta(p.assetId).catch(()=>null)));
+      for(let i=0;i<relevant.length;i++){
+        const p=relevant[i], m=metas[i];
+        out.push({source:'theposterdb',id:p.assetId,setId:page.id,imageUrl:tpdb.assetImageUrl(p.assetId),language:m?.language||null,variation:m?.variation||null,label:[m?.language,m?.variation,ctx.type==='series'?'Show Cover':'Movie',`page ${page.id}`].filter(Boolean).join(' / ')});
+      }
+    } catch(e){ logger.debug(`TPDB browse page ${page.id} failed:`,e.message); }
   }
-  const seen=new Set(); return out.filter(o=>{const k=o.id;if(seen.has(k))return false;seen.add(k);return true;});
+  return out;
 }
 
 async function browse(mediaRow){
